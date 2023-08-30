@@ -1,0 +1,166 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import torchvision.models as models
+from sklearn.cluster import DBSCAN
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+import io
+from torch.autograd import Variable
+from torch.nn import functional as F
+import requests
+
+
+def hook(model,input,output):
+  print("function")
+  f_maps.append(output)
+  print(output)
+
+def generate_cam(feature_map,weight_FC,class_id):
+
+  #upsampling activation maps to size of image:
+  size_upsample=(32,32)
+  c, h, w = feature_map.shape
+
+  output_cam=[]
+  feature_map=torch.round(feature_map).to(torch.int)
+  feature_map=np.array(feature_map.detach().cpu())
+  cam = np.sum(weight_FC[class_id].reshape((c,1,1)) * feature_map.reshape((c, h,w)), 0)
+  #cam=cam.reshape(h,w)
+
+  # Normalization in the range of 0-1
+  cam = cam - np.min(cam)
+  cam_img = cam / np.max(cam)
+  # modify the array’s data-type to uint8.
+  cam_img = np.uint8(255 * cam_img)
+  # Append the CAM output to the 'output_cam' list
+  output_cam.append(cv2.resize(cam_img, size_upsample))
+  return output_cam
+
+
+#loading the pretrained vgg16 model
+model=models.vgg16(pretrained=True)
+
+#preparing dataset and loaders
+
+transform=transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
+
+trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2)
+
+testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+testloader = torch.utils.data.DataLoader(testset, batch_size=256, shuffle=False, num_workers=2)
+
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model = model.cuda()
+
+# Define the loss function and optimizer
+criterion = nn.CrossEntropyLoss().cuda()
+optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+
+
+print(model)
+
+#choosing image for forward pass through model
+image,label=testset[2]
+image=image.unsqueeze(0)
+image=image.cuda()
+label=torch.tensor(label)
+label=label.cuda()
+label_num=label.item()
+predictions=model(image)
+
+
+
+#extracting feature maps of last convolutional layer of model
+f_maps=[]
+print("feature{}".format(len(f_maps)))
+
+print(model.features[28])
+finalconv=model.features[28]
+finalconv.register_forward_hook(hook(model,image,predictions))
+f_maps=torch.stack(f_maps)
+print(f_maps.size())
+
+
+#preparing model
+
+model.eval()
+
+
+
+
+
+
+
+
+#getting weights of last FC layer
+#storing all network parameters
+params=list(model.parameters())
+
+#extracting weights of last layer
+weight_FC=params[-1].detach().cpu()
+weight_FC=weight_FC.numpy()
+weight_FC=np.squeeze(weight_FC)
+
+
+#obtaining list of all classes of cifar-10
+classes=np.array(['airplanes','cars','birds','cats','deer','dogs','frogs','horses','ships','trucks'])
+#selecting target class
+predictions=predictions.detach().cpu()
+target_class=torch.max(predictions,dim=1)
+print(target_class)
+target_class=np.array(target_class)
+print("target {}".format(target_class))
+
+cams=generate_cam(f_maps,weight_FC,target_class[1])
+
+dim=(224,224)
+
+
+#using applyColourMap to apply a colour map on resized heatmap
+heatmap=cv2.applyColorMap(cv2.resize(cams[0],dim),cv2.COLORMAP_JET)
+
+print("The resized CAM heatmap for the class with label{} is:{}".format(label_num,heatmap))
+print("the input image is:{}".format(image))
+
+
+
+#reducing heatmap and image to same dimension
+
+
+
+#plotting the results:
+fig=plt.figure(figsize=(12,4))
+#plotting the original image
+im=fig.add_subplot(1,3,1)
+image=image.detach().cpu()
+image=image.squeeze()
+image=image.swapaxes(0,1)
+image=image.swapaxes(1,2)
+imgplot = plt.imshow(image)
+print("image size{}".format(image.shape))
+plt.axis('off')
+im.set_title('input image')
+# Plot the CAM Heatmap
+im = fig.add_subplot(1, 3, 2)
+imgplot = plt.imshow(heatmap)
+print("heatmap size{}".format(heatmap.shape))
+plt.axis('off')
+im.set_title('CAM Heatmap')
+# Plot the overlaying
+im = fig.add_subplot(1, 3, 3)
+# overlaying heatmap and resized input image.
+print("heatmap {}",format(heatmap))
+result = np.add(heatmap * 0.5,image * 0.5)/255
+imgplot = plt.imshow(result)
+plt.axis('off')
+im.set_title('Overlaying')
