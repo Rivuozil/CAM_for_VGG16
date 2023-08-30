@@ -1,0 +1,220 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import torchvision.models as models
+from sklearn.cluster import DBSCAN
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+import io
+from torch.autograd import Variable
+from torch.nn import functional as F
+import requests
+from sklearn.cluster import DBSCAN
+from tensorflow.keras.datasets import cifar10
+
+#loading the pretrained vgg16 model
+model=models.vgg16(pretrained=True)
+
+fea_maps=[]
+outputs=[]
+target_class=np.zeros((50,1))
+def hook(model,input,output,layer):
+  print("function")
+  fea_maps.append(output)
+  print("output hook {}".format(output.shape))
+  return hook
+def generate_cam(feature_map,weight_FC,class_id):
+
+  #upsampling activation maps to size of image:
+  size_upsample=(32,32)
+  c, h, w = feature_map.shape
+
+  output_cam=[]
+  feature_map=torch.round(feature_map).to(torch.int)
+  feature_map=np.array(feature_map.detach().cpu())
+  cam = np.sum(weight_FC[class_id].reshape((c,1,1)) * feature_map.reshape((c,h,w)), 0)
+  #cam=cam.reshape(h,w)
+
+  # Normalization in the range of 0-1
+  cam = cam - np.min(cam)
+  cam_img = cam / np.max(cam)
+  # modify the array’s data-type to uint8.
+  cam_img = np.uint8(255 * cam_img)
+  # Append the CAM output to the 'output_cam' list
+  output_cam.append(cv2.resize(cam_img, size_upsample))
+  return output_cam
+
+#preparing dataset and loaders
+
+transform=transforms.Compose([
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomCrop(32, padding=4),
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
+
+trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=50, shuffle=True, num_workers=2)
+
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model = model.cuda()
+
+# Define the loss function and optimizer
+criterion = nn.CrossEntropyLoss().cuda()
+optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+
+
+print(model)
+
+def extract_images(dataset,labels,num_per_class=5):
+
+  ext_img=[]
+  i=0
+  for i in range(5):
+    for class_idx in range(len(labels)):
+      index=np.where(np.array(labels)==labels[class_idx])[0][:num_per_class]
+      for idx in index:
+        image=dataset[idx][0]
+        print("image shape in func {}".format(image.shape))
+        image.squeeze(0)
+        ext_img.append(image)
+        print("ext_img shape in func {}".format(image.shape))
+
+
+    i=i+1
+
+  return ext_img
+
+def extract_labels(dataset,labels,num_per_class=5):
+
+  ext_lbl=[]
+  i=0
+  for i in range(5):
+    for class_idx in range(len(labels)):
+      index=np.where(np.array(labels)==labels[class_idx])[0][:num_per_class]
+      for idx in index:
+        label=dataset[idx][1]
+        #label_num=label.item()
+        ext_lbl.append(label)
+
+    i=i+1
+
+  return ext_lbl
+#obtaining list of all classes of cifar-10
+class_labels=np.array(['airplanes','cars','birds','cats','deer','dogs','frogs','horses','ships','trucks'])
+
+#Store the extracted images together as a batch
+batch_images = np.array(extract_images(trainset,class_labels))
+batch_labels = np.array(extract_labels(trainset,class_labels))
+print("size of batch image {}".format(batch_images.shape))
+print("size of batch labels {}".format(batch_labels.shape))
+#target_layer=model.features[7]
+
+#extracting weights of last layer
+#storing all network parameters
+params=list(model.parameters())
+weight_FC=params[-1].detach().cpu()
+weight_FC=weight_FC.numpy()
+weight_FC=np.squeeze(weight_FC)
+
+finalconv=model.features[12]
+
+#
+#print(f_maps.size())
+
+
+for i in range(len(batch_images)):
+  model.train()
+  image=batch_images[i]
+  print("shape of image {}".format(image.shape))
+  image=image.unsqueeze(0)
+  image=torch.tensor(image)
+  image=image.cuda()
+  print("image size {}".format(image.shape))
+  model=model.cuda()
+  output=model(image)
+  outputs.append(output)
+  print("output shape {}".format(len(outputs)))
+  output=output.detach().cpu()
+  target=torch.max(output,dim=1)
+  print("target {}".format(target))
+  target_class[i]=(target[1])
+  print("size of target class {}".format(target_class))
+
+model.eval()
+for i in range(len(batch_images)):
+  image=batch_images[i].detach().cpu()
+  output=outputs[i].detach().cpu()
+  model=model.cpu()
+  finalconv.register_forward_hook(hook(model,image,output,finalconv))
+
+fea_maps=torch.stack(fea_maps)
+print("the feature map size {}".format(fea_maps.shape))
+
+red_features=[]
+for i in range(fea_maps.size(0)):
+  feature_map=fea_maps[i]
+  feature_map=feature_map.unsqueeze(dim=0)
+  print("feature shape {}".format(feature_map.shape))
+  class_id=int(target_class[i])
+  print("class id{}".format(class_id))
+  cam=generate_cam(feature_map,weight_FC,class_id)
+  #cam=cam.squeeze()
+  cam=torch.tensor(cam)
+  cam=cam.flatten()
+  print("torch {}".format(cam))
+  red_features.append(cam.numpy())
+
+print("reduced features {}".format(red_features[23].shape))
+dbscan=DBSCAN(eps=0.5,min_samples=4)
+red_features=np.array(red_features)
+#red_features=red_features.reshape(-1,1)
+db=dbscan.fit(red_features)
+labels=db.labels_
+
+# Number of clusters in labels, ignoring noise if present.
+n_clusters_ = len(set(labels)) - (1 if -1 in labels else 0)
+n_noise_ = list(labels).count(-1)
+
+print("Estimated number of clusters: %d" % n_clusters_)
+print("Estimated number of noise points: %d" % n_noise_)
+
+unique_labels = set(labels)
+core_samples_mask = np.zeros_like(labels, dtype=bool)
+core_samples_mask[db.core_sample_indices_] = True
+
+colors = [plt.cm.Spectral(each) for each in np.linspace(0, 1, len(unique_labels))]
+for k, col in zip(unique_labels, colors):
+    if k == -1:
+        # Black used for noise.
+        col = [0, 0, 0, 1]
+
+    class_member_mask = labels == k
+
+    xy = db[class_member_mask & core_samples_mask]
+    plt.plot(
+        xy[:, 0],
+        xy[:, 1],
+        "o",
+        markerfacecolor=tuple(col),
+        markeredgecolor="k",
+        markersize=14,
+    )
+
+    xy = db[class_member_mask & ~core_samples_mask]
+    plt.plot(
+        xy[:, 0],
+        xy[:, 1],
+        "o",
+        markerfacecolor=tuple(col),
+        markeredgecolor="k",
+        markersize=6,
+    )
+
+plt.title(f"Estimated number of clusters: {n_clusters_}")
+plt.show()
